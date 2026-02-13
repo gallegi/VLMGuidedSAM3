@@ -704,7 +704,7 @@ def collect_tracking_data_sav_train(
                     
                     if pred_mask.shape != (video_height, video_width):
                         pred_mask = cv2.resize(pred_mask.astype(np.float32), (video_width, video_height), interpolation=cv2.INTER_LINEAR)
-                    pred_mask = (pred_mask > 0.5).astype(np.uint8)
+                    pred_mask = (pred_mask > 0.0).astype(np.uint8)
                 else:
                     pred_mask = np.zeros((video_height, video_width), dtype=np.uint8)
                 
