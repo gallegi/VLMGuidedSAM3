@@ -634,44 +634,40 @@ def collect_tracking_data_sav_train(
         frame_idx = 0
         
         while frame_idx < num_frames:
-            # Handle conditioning frames
-            if frame_idx in consolidated_frame_inds.get("cond_frame_outputs", {}):
-                current_out = output_dict["cond_frame_outputs"][frame_idx]
-            else:
-                # Get features for tracking
-                (
-                    _,
-                    _,
-                    current_vision_feats,
-                    current_vision_pos_embeds,
-                    feat_sizes,
-                ) = tracker._get_image_feature(inference_state, frame_idx, batch_size)
-                
-                image = inference_state["images"][frame_idx].cuda(non_blocking=True).float().unsqueeze(0)
-                
-                # Track
-                current_out = tracker.track_step(
-                    frame_idx=frame_idx,
-                    is_init_cond_frame=False,
-                    current_vision_feats=current_vision_feats,
-                    current_vision_pos_embeds=current_vision_pos_embeds,
-                    feat_sizes=feat_sizes,
-                    image=image,
-                    point_inputs=None,
-                    mask_inputs=None,
-                    output_dict=output_dict,
-                    num_frames=inference_state["num_frames"],
-                    track_in_reverse=False,
-                    run_mem_encoder=True,
-                )
+            # Get features for tracking
+            (
+                _,
+                _,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+            ) = tracker._get_image_feature(inference_state, frame_idx, batch_size)
+            
+            image = inference_state["images"][frame_idx].cuda(non_blocking=True).float().unsqueeze(0)
+            
+            # Track
+            current_out = tracker.track_step(
+                frame_idx=frame_idx,
+                is_init_cond_frame=False,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                image=image,
+                point_inputs=None,
+                mask_inputs=None,
+                output_dict=output_dict,
+                num_frames=inference_state["num_frames"],
+                track_in_reverse=False,
+                run_mem_encoder=True,
+            )
 
-                # to cpu to save memory
-                for k, v in current_out.items():
-                    if isinstance(v, torch.Tensor) and k not in ["obj_ptr"]:
-                        current_out[k] = v.cpu()
-                
-                output_dict["non_cond_frame_outputs"][frame_idx] = current_out
-                consolidated_frame_inds["non_cond_frame_outputs"].add(frame_idx)
+            # to cpu to save memory
+            for k, v in current_out.items():
+                if isinstance(v, torch.Tensor) and k not in ["obj_ptr"]:
+                    current_out[k] = v.cpu()
+            
+            output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+            consolidated_frame_inds["non_cond_frame_outputs"].add(frame_idx)
             
             # Process each object
             for i, obj_id in enumerate(obj_ids):
@@ -708,19 +704,6 @@ def collect_tracking_data_sav_train(
                 else:
                     pred_mask = np.zeros((video_height, video_width), dtype=np.uint8)
                 
-                # Get eff_iou_score for occlusion detection
-                eff_iou = 0.0
-                if "eff_iou_score" in current_out:
-                    eff = current_out["eff_iou_score"]
-                    if isinstance(eff, torch.Tensor):
-                        if eff.dim() == 0:
-                            eff_iou = float(eff.item())
-                        elif eff.numel() > i:
-                            eff_iou = float(eff[i].item())
-                        elif eff.numel() == 1:
-                            eff_iou = float(eff.item())
-                    else:
-                        eff_iou = float(eff)
                 
                 # Detect occlusion/reappearance based ONLY on GT
                 # Only check occlusion on frames that have GT annotations (every 4th frame)
@@ -1111,6 +1094,12 @@ def main():
         help="Specific sequence ID to process (if not provided, processes all)",
     )
     parser.add_argument(
+        "--sub_dir",
+        type=str,
+        default=None,
+        help="Specific sub folder of SAV dataset to process (e.g., sav_000, if not provided, processes all sub folders)",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./training_data",
@@ -1233,12 +1222,22 @@ def main():
                     })
         
         logger.info(f"Found {len(all_sequences)} sequences with annotations")
+
+        if args.sub_dir:
+            # Filter to specific subdirectory
+            all_sequences = [s for s in all_sequences if s['subdir'] == args.sub_dir]
+            if not all_sequences:
+                logger.error(f"Subdirectory {args.sub_dir} not found or contains no annotated sequences")
+                sys.exit(1)
         
         if args.sequence_id:
             # Filter to specific sequence
             all_sequences = [s for s in all_sequences if s['video_id'] == args.sequence_id]
             if not all_sequences:
-                logger.error(f"Sequence {args.sequence_id} not found")
+                if args.sub_dir:
+                    logger.error(f"Sequence {args.sequence_id} not found in subdirectory {args.sub_dir}")
+                else:
+                    logger.error(f"Sequence {args.sequence_id} not found")
                 sys.exit(1)
         
         if args.max_sequences:
@@ -1277,7 +1276,6 @@ def main():
                     skipped_sequences.append(video_id)
                     continue
             
-            print("here")
             try:
                 # Load annotations first to check if valid
                 annotations = load_sav_train_annotations(annotation_json)
