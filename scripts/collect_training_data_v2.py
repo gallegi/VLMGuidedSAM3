@@ -767,82 +767,78 @@ def collect_tracking_data_sav_train(
                 # Only check failures on annotated frames (every 4th frame)
                 frame_has_gt_annotations = frame_idx in gt_masks_lookup
                 
-                if not frame_has_gt_annotations:
-                    # Skip failure tracking on non-annotated frames
-                    pass
-                else:
-                    # Frame has GT annotations - check for failures
-                    has_gt = False
-                    iou = 0.0  # Default to 0.0 (no overlap)
-                    gt_mask = None  # Initialize for bbox computation
+                # Frame has GT annotations - check for failures
+                has_gt = False
+                iou = 0.0  # Default to 0.0 (no overlap)
+                gt_mask = None  # Initialize for bbox computation
+                
+                if obj_id in gt_masks_lookup.get(frame_idx, {}):
+                    gt_mask = gt_masks_lookup[frame_idx][obj_id]
                     
-                    if obj_id in gt_masks_lookup[frame_idx]:
-                        gt_mask = gt_masks_lookup[frame_idx][obj_id]
-                        
-                        # Only compute IoU if object is actually present in GT (non-empty mask)
-                        if gt_mask is not None and gt_mask.sum() > 0:
-                            has_gt = True
-                            iou = compute_mask_iou(pred_mask, gt_mask)
-                            objects_summary[obj_id]["ious"].append(iou)
+                    # Only compute IoU if object is actually present in GT (non-empty mask)
+                    if gt_mask is not None and gt_mask.sum() > 0:
+                        has_gt = True
+                        iou = compute_mask_iou(pred_mask, gt_mask)
+                        objects_summary[obj_id]["ious"].append(iou)
+                
+                # Store per-frame data for training data generation
+                is_correct = has_gt and iou >= iou_threshold
+                objects_summary[obj_id]["frames"].append({
+                    "frame_idx": frame_idx,
+                    "has_prediction": pred_mask is not None and pred_mask.sum() > 0,
+                    "has_gt": has_gt,
+                    "iou": round(float(iou), 2),
+                    "is_correct": is_correct,
+                    "pred_bbox": mask_to_bbox(pred_mask),
+                    "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
+                })
+                
+                # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
+                is_failure = False
+                failure_type = None
+                if has_gt:
+                    # Failure if IoU is below threshold
+                    if iou < iou_threshold:
+                        is_failure = True
+                        failure_type = "low_iou"
+                elif frame_has_gt_annotations and pred_mask.sum() > 0:
+                    # Failure if prediction exists but object not in GT (false positive on annotated frame)
+                    is_failure = True
+                    failure_type = "false_positive"
+                
+                if is_failure:
+                    objects_summary[obj_id]["num_failures"] += 1
                     
-                    # Store per-frame data for training data generation
-                    is_correct = has_gt and iou >= iou_threshold
-                    objects_summary[obj_id]["frames"].append({
+                    # Determine if failure is at SAM3 reappearance
+                    # Failures during occlusion (after occlusion starts, before reappearance) are also reappearance failures
+                    # Failures at reappearance frame or within 5 frames after are also reappearance failures
+                    failure_is_at_sam3_reappearance = (
+                        obj_state["is_occluded"] or  # During occlusion
+                        is_at_reappearance or  # At reappearance frame
+                        obj_state["just_reappeared"]  # Within 5 frames after reappearance
+                    )
+                    
+                    # Get occlusion_id
+                    failure_occlusion_id = None
+                    if obj_state["is_occluded"]:
+                        failure_occlusion_id = obj_state["current_occlusion_id"]
+                    elif failure_is_at_sam3_reappearance and obj_state["reappearance_frame"] is not None:
+                        # Find the occlusion that just ended
+                        for occ in objects_summary[obj_id]["occlusions"]:
+                            if occ["end_frame"] == obj_state["reappearance_frame"]:
+                                failure_occlusion_id = occ["occlusion_id"]
+                                break
+                    
+                    objects_summary[obj_id]["failure_frames"].append({
                         "frame_idx": frame_idx,
-                        "has_prediction": pred_mask is not None and pred_mask.sum() > 0,
-                        "has_gt": has_gt,
                         "iou": round(float(iou), 2),
-                        "is_correct": is_correct,
+                        "failure_type": failure_type,
+                        "has_gt": has_gt,
+                        "is_at_sam3_reappearance": failure_is_at_sam3_reappearance,
+                        "occlusion_id": failure_occlusion_id,
                         "pred_bbox": mask_to_bbox(pred_mask),
                         "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
                     })
-                    
-                    # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
-                    is_failure = False
-                    failure_type = None
-                    if has_gt:
-                        # Failure if IoU is below threshold
-                        if iou < iou_threshold:
-                            is_failure = True
-                            failure_type = "low_iou"
-                    elif pred_mask.sum() > 0:
-                        # Failure if prediction exists but object not in GT (false positive on annotated frame)
-                        is_failure = True
-                        failure_type = "false_positive"
-                    
-                    if is_failure:
-                        objects_summary[obj_id]["num_failures"] += 1
-                        
-                        # Determine if failure is at SAM3 reappearance
-                        # Failures during occlusion (after occlusion starts, before reappearance) are also reappearance failures
-                        # Failures at reappearance frame or within 5 frames after are also reappearance failures
-                        failure_is_at_sam3_reappearance = (
-                            obj_state["is_occluded"] or  # During occlusion
-                            is_at_reappearance or  # At reappearance frame
-                            obj_state["just_reappeared"]  # Within 5 frames after reappearance
-                        )
-                        
-                        # Get occlusion_id
-                        failure_occlusion_id = None
-                        if obj_state["is_occluded"]:
-                            failure_occlusion_id = obj_state["current_occlusion_id"]
-                        elif failure_is_at_sam3_reappearance and obj_state["reappearance_frame"] is not None:
-                            # Find the occlusion that just ended
-                            for occ in objects_summary[obj_id]["occlusions"]:
-                                if occ["end_frame"] == obj_state["reappearance_frame"]:
-                                    failure_occlusion_id = occ["occlusion_id"]
-                                    break
-                        
-                        objects_summary[obj_id]["failure_frames"].append({
-                            "frame_idx": frame_idx,
-                            "iou": round(float(iou), 2),
-                            "failure_type": failure_type,
-                            "has_gt": has_gt,
-                            "is_at_sam3_reappearance": failure_is_at_sam3_reappearance,
-                            "occlusion_id": failure_occlusion_id,
-                            "pred_bbox": mask_to_bbox(pred_mask),
-                            "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
-                        })
                 
                 # Store mask for visualization only
                 if frame_idx not in pred_masks_cache:
@@ -1250,8 +1246,6 @@ def main():
         sequence_summaries = []
         viz_videos_saved = 0
 
-        print("All sequences:", all_sequences)
-        
         for seq_idx, seq_info in enumerate(all_sequences):
             video_id = seq_info['video_id']
             video_path = seq_info['video_path']
