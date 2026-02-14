@@ -676,6 +676,10 @@ def collect_tracking_data_sav_train(
                 # if first_frame_masks[obj_id]['first_frame'] > frame_idx:
                 #     # Object hasn't appeared yet - skip
                 #     continue
+
+                if first_frame_masks[obj_id]['first_frame'] > frame_idx:
+                    # The object hasn't appeared yet - skip to avoid SAM3's hallucination
+                    continue
                 
                 if obj_id not in objects_summary:
                     objects_summary[obj_id] = {"ious": [], "frames": [], "occlusions": [], "failure_frames": [], "num_failures": 0}
