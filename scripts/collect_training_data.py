@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -25,6 +26,8 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image as PILImage
+
+from sam3.model_builder import build_sam3_video_model
 
 try:
     import pycocotools.mask as mask_utils
@@ -36,9 +39,12 @@ except ImportError:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    force=True
 )
 logger = logging.getLogger(__name__)
+
+FRAME_INTERVAL = 4
 
 
 def compute_mask_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
@@ -182,8 +188,11 @@ def load_sav_train_annotations(json_path: str) -> Dict:
     
     # Build first appearance frame dict
     first_appeared_frame = {}
-    for obj_idx, frame_idx in enumerate(first_appeared):
-        first_appeared_frame[obj_idx + 1] = int(frame_idx)  # obj_id is 1-indexed
+    # SAV annotate at 6fps from 24fps video, 
+    # there are annotations at every 4th frame, so we multiply annotation index by 4 to get frame index
+    for obj_idx, ann_idx in enumerate(first_appeared):
+        frame_idx = int(ann_idx * FRAME_INTERVAL)  # Convert annotation index to frame index
+        first_appeared_frame[obj_idx + 1] = int(ann_idx * FRAME_INTERVAL)  # obj_id is 1-indexed
     
     # Build masks dict
     # masklets is a list where masklets[ann_idx] is a list of per-object masks
@@ -198,10 +207,9 @@ def load_sav_train_annotations(json_path: str) -> Dict:
     
     if num_annotated > 0 and video_frame_count > 0:
         # SA-V training: annotations at 6fps from 24fps = every 4 frames
-        frame_interval = 4
         
         for ann_idx, frame_masks in enumerate(masklets):
-            frame_idx = ann_idx * frame_interval
+            frame_idx = ann_idx * FRAME_INTERVAL
             if frame_idx >= video_frame_count:
                 frame_idx = video_frame_count - 1
             
@@ -214,7 +222,7 @@ def load_sav_train_annotations(json_path: str) -> Dict:
                 if mask is not None:
                     masks[frame_idx][obj_id] = mask
         
-        logger.info(f"Loaded {len(masks)} annotated frames (interval={frame_interval}, total_video_frames={video_frame_count})")
+        logger.info(f"Loaded {len(masks)} annotated frames (interval={FRAME_INTERVAL}, total_video_frames={video_frame_count})")
     
     return {
         'num_objects': num_objects,
@@ -562,34 +570,25 @@ def collect_tracking_data_sav_train(
     # Add objects - SAM3 only supports adding objects before tracking starts
     # So we only track objects that appear at frame 0 or have masks available at frame 0
     tracked_obj_ids = []
-    skipped_obj_ids = []
     
     for obj_id, info in first_frame_masks.items():
         mask = info['mask']
         first_frame = info['first_frame']
         
-        # Only add objects that appear at frame 0 (or very early frames we can use as init)
-        if first_frame <= 4:  # Allow objects appearing in first few frames
-            mask_tensor = torch.from_numpy(mask.astype(np.float32))
-            tracker.add_new_mask(
-                inference_state=inference_state,
-                frame_idx=first_frame,
-                obj_id=int(obj_id),
-                mask=mask_tensor,
-            )
-            tracked_obj_ids.append(obj_id)
-            logger.info(f"  Added object {obj_id} at frame {first_frame} ({mask.sum()} pixels)")
-        else:
-            # Skip objects that appear later - SAM3 can't add them mid-tracking
-            skipped_obj_ids.append((obj_id, first_frame))
-            logger.warning(f"  Skipping object {obj_id} (first appears at frame {first_frame}) - SAM3 can't add objects after tracking starts")
+        # Add objects at their first appearance frame
+        mask_tensor = torch.from_numpy(mask.astype(np.float32))
+        tracker.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=first_frame,
+            obj_id=int(obj_id),
+            mask=mask_tensor,
+        )
+        tracked_obj_ids.append(obj_id)
+        logger.info(f"  Added object {obj_id} at frame {first_frame} ({mask.sum()} pixels)")
     
     if not tracked_obj_ids:
-        logger.error(f"No objects to track for {sequence_id} (all objects appear too late)")
+        logger.error(f"No objects to track for {sequence_id}")
         return {"error": "no_trackable_objects"}
-    
-    if skipped_obj_ids:
-        logger.warning(f"  Skipped {len(skipped_obj_ids)} objects that appear after frame 4")
     
     # Prepare tracking
     tracker.propagate_in_video_preflight(inference_state)
@@ -635,43 +634,52 @@ def collect_tracking_data_sav_train(
         frame_idx = 0
         
         while frame_idx < num_frames:
-            # Handle conditioning frames
-            if frame_idx in consolidated_frame_inds.get("cond_frame_outputs", {}):
-                current_out = output_dict["cond_frame_outputs"][frame_idx]
-            else:
-                # Get features for tracking
-                (
-                    _,
-                    _,
-                    current_vision_feats,
-                    current_vision_pos_embeds,
-                    feat_sizes,
-                ) = tracker._get_image_feature(inference_state, frame_idx, batch_size)
-                
-                image = inference_state["images"][frame_idx].cuda(non_blocking=True).float().unsqueeze(0)
-                
-                # Track
-                current_out = tracker.track_step(
-                    frame_idx=frame_idx,
-                    is_init_cond_frame=False,
-                    current_vision_feats=current_vision_feats,
-                    current_vision_pos_embeds=current_vision_pos_embeds,
-                    feat_sizes=feat_sizes,
-                    image=image,
-                    point_inputs=None,
-                    mask_inputs=None,
-                    output_dict=output_dict,
-                    num_frames=inference_state["num_frames"],
-                    track_in_reverse=False,
-                    run_mem_encoder=True,
-                )
-                
-                output_dict["non_cond_frame_outputs"][frame_idx] = current_out
-                consolidated_frame_inds["non_cond_frame_outputs"].add(frame_idx)
+            # Get features for tracking
+            (
+                _,
+                _,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+            ) = tracker._get_image_feature(inference_state, frame_idx, batch_size)
+            
+            image = inference_state["images"][frame_idx].cuda(non_blocking=True).float().unsqueeze(0)
+            
+            # Track
+            current_out = tracker.track_step(
+                frame_idx=frame_idx,
+                is_init_cond_frame=False,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                image=image,
+                point_inputs=None,
+                mask_inputs=None,
+                output_dict=output_dict,
+                num_frames=inference_state["num_frames"],
+                track_in_reverse=False,
+                run_mem_encoder=True,
+            )
+
+            # to cpu to save memory
+            for k, v in current_out.items():
+                if isinstance(v, torch.Tensor) and k not in ["obj_ptr"]:
+                    current_out[k] = v.cpu()
+            
+            output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+            consolidated_frame_inds["non_cond_frame_outputs"].add(frame_idx)
             
             # Process each object
             for i, obj_id in enumerate(obj_ids):
                 obj_id = int(obj_id)
+
+                # if first_frame_masks[obj_id]['first_frame'] > frame_idx:
+                #     # Object hasn't appeared yet - skip
+                #     continue
+
+                if first_frame_masks[obj_id]['first_frame'] > frame_idx:
+                    # The object hasn't appeared yet - skip to avoid SAM3's hallucination
+                    continue
                 
                 if obj_id not in objects_summary:
                     objects_summary[obj_id] = {"ious": [], "frames": [], "occlusions": [], "failure_frames": [], "num_failures": 0}
@@ -696,23 +704,10 @@ def collect_tracking_data_sav_train(
                     
                     if pred_mask.shape != (video_height, video_width):
                         pred_mask = cv2.resize(pred_mask.astype(np.float32), (video_width, video_height), interpolation=cv2.INTER_LINEAR)
-                    pred_mask = (pred_mask > 0.5).astype(np.uint8)
+                    pred_mask = (pred_mask > 0.0).astype(np.uint8)
                 else:
                     pred_mask = np.zeros((video_height, video_width), dtype=np.uint8)
                 
-                # Get eff_iou_score for occlusion detection
-                eff_iou = 0.0
-                if "eff_iou_score" in current_out:
-                    eff = current_out["eff_iou_score"]
-                    if isinstance(eff, torch.Tensor):
-                        if eff.dim() == 0:
-                            eff_iou = float(eff.item())
-                        elif eff.numel() > i:
-                            eff_iou = float(eff[i].item())
-                        elif eff.numel() == 1:
-                            eff_iou = float(eff.item())
-                    else:
-                        eff_iou = float(eff)
                 
                 # Detect occlusion/reappearance based ONLY on GT
                 # Only check occlusion on frames that have GT annotations (every 4th frame)
@@ -776,82 +771,73 @@ def collect_tracking_data_sav_train(
                 # Only check failures on annotated frames (every 4th frame)
                 frame_has_gt_annotations = frame_idx in gt_masks_lookup
                 
-                if not frame_has_gt_annotations:
-                    # Skip failure tracking on non-annotated frames
-                    pass
-                else:
-                    # Frame has GT annotations - check for failures
-                    has_gt = False
-                    iou = 0.0  # Default to 0.0 (no overlap)
-                    gt_mask = None  # Initialize for bbox computation
-                    
-                    if obj_id in gt_masks_lookup[frame_idx]:
-                        gt_mask = gt_masks_lookup[frame_idx][obj_id]
-                        
-                        # Only compute IoU if object is actually present in GT (non-empty mask)
-                        if gt_mask is not None and gt_mask.sum() > 0:
-                            has_gt = True
-                            iou = compute_mask_iou(pred_mask, gt_mask)
-                            objects_summary[obj_id]["ious"].append(iou)
-                    
-                    # Store per-frame data for training data generation
-                    is_correct = has_gt and iou >= iou_threshold
-                    objects_summary[obj_id]["frames"].append({
-                        "frame_idx": frame_idx,
-                        "has_prediction": pred_mask is not None and pred_mask.sum() > 0,
-                        "has_gt": has_gt,
-                        "iou": round(float(iou), 2),
-                        "is_correct": is_correct,
-                        "pred_bbox": mask_to_bbox(pred_mask),
-                        "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
-                    })
-                    
-                    # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
-                    is_failure = False
-                    failure_type = None
-                    if has_gt:
-                        # Failure if IoU is below threshold
-                        if iou < iou_threshold:
-                            is_failure = True
-                            failure_type = "low_iou"
-                    elif pred_mask.sum() > 0:
-                        # Failure if prediction exists but object not in GT (false positive on annotated frame)
+                # Frame has GT annotations - check for failures
+                iou = 0.0  # Default to 0.0 (no overlap)
+                gt_mask = None  # Initialize for bbox computation
+                
+                if has_gt_mask:
+                    gt_mask = gt_masks_lookup[frame_idx][obj_id]
+                    iou = compute_mask_iou(pred_mask, gt_mask)
+                    objects_summary[obj_id]["ious"].append(iou)
+                
+                # Store per-frame data for training data generation
+                is_correct = has_gt_mask and iou >= iou_threshold
+                objects_summary[obj_id]["frames"].append({
+                    "frame_idx": frame_idx,
+                    "has_prediction": pred_mask is not None and pred_mask.sum() > 0,
+                    "has_gt": has_gt_mask,
+                    "iou": round(float(iou), 2),
+                    "is_correct": is_correct,
+                    "pred_bbox": mask_to_bbox(pred_mask),
+                    "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
+                })
+                
+                # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
+                is_failure = False
+                failure_type = None
+                if has_gt_mask:
+                    # Failure if IoU is below threshold
+                    if iou < iou_threshold:
                         is_failure = True
-                        failure_type = "false_positive"
+                        failure_type = "low_iou"
+                elif frame_has_gt_annotations and pred_mask.sum() > 0:
+                    # Failure if prediction exists but object not in GT (false positive on annotated frame)
+                    is_failure = True
+                    failure_type = "false_positive"
+                
+                if is_failure:
+                    objects_summary[obj_id]["num_failures"] += 1
                     
-                    if is_failure:
-                        objects_summary[obj_id]["num_failures"] += 1
-                        
-                        # Determine if failure is at SAM3 reappearance
-                        # Failures during occlusion (after occlusion starts, before reappearance) are also reappearance failures
-                        # Failures at reappearance frame or within 5 frames after are also reappearance failures
-                        failure_is_at_sam3_reappearance = (
-                            obj_state["is_occluded"] or  # During occlusion
-                            is_at_reappearance or  # At reappearance frame
-                            obj_state["just_reappeared"]  # Within 5 frames after reappearance
-                        )
-                        
-                        # Get occlusion_id
-                        failure_occlusion_id = None
-                        if obj_state["is_occluded"]:
-                            failure_occlusion_id = obj_state["current_occlusion_id"]
-                        elif failure_is_at_sam3_reappearance and obj_state["reappearance_frame"] is not None:
-                            # Find the occlusion that just ended
-                            for occ in objects_summary[obj_id]["occlusions"]:
-                                if occ["end_frame"] == obj_state["reappearance_frame"]:
-                                    failure_occlusion_id = occ["occlusion_id"]
-                                    break
-                        
-                        objects_summary[obj_id]["failure_frames"].append({
-                            "frame_idx": frame_idx,
-                            "iou": round(float(iou), 2),
-                            "failure_type": failure_type,
-                            "has_gt": has_gt,
-                            "is_at_sam3_reappearance": failure_is_at_sam3_reappearance,
-                            "occlusion_id": failure_occlusion_id,
-                            "pred_bbox": mask_to_bbox(pred_mask),
-                            "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
-                        })
+                    # Determine if failure is at SAM3 reappearance
+                    # Failures during occlusion (after occlusion starts, before reappearance) are also reappearance failures
+                    # Failures at reappearance frame or within 5 frames after are also reappearance failures
+                    failure_is_at_sam3_reappearance = (
+                        obj_state["is_occluded"] or  # During occlusion
+                        is_at_reappearance or  # At reappearance frame
+                        obj_state["just_reappeared"]  # Within 5 frames after reappearance
+                    )
+                    
+                    # Get occlusion_id
+                    failure_occlusion_id = None
+                    if obj_state["is_occluded"]:
+                        failure_occlusion_id = obj_state["current_occlusion_id"]
+                    elif failure_is_at_sam3_reappearance and obj_state["reappearance_frame"] is not None:
+                        # Find the occlusion that just ended
+                        for occ in objects_summary[obj_id]["occlusions"]:
+                            if occ["end_frame"] == obj_state["reappearance_frame"]:
+                                failure_occlusion_id = occ["occlusion_id"]
+                                break
+                    
+                    objects_summary[obj_id]["failure_frames"].append({
+                        "frame_idx": frame_idx,
+                        "iou": round(float(iou), 2),
+                        "failure_type": failure_type,
+                        "has_gt": has_gt_mask,
+                        "is_at_sam3_reappearance": failure_is_at_sam3_reappearance,
+                        "occlusion_id": failure_occlusion_id,
+                        "pred_bbox": mask_to_bbox(pred_mask),
+                        "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
+                    })
                 
                 # Store mask for visualization only
                 if frame_idx not in pred_masks_cache:
@@ -1057,6 +1043,34 @@ def visualize_tracking_video_sav_train(
     video_writer.release()
     logger.info(f"Saved visualization video to {output_video_path}")
 
+def optimize_video(src: Path, dst: Path, max_width: int, overwrite: bool):
+    if dst.exists() and not overwrite:
+        return
+
+    logger.info(f"Optimizing: {src.name}")
+
+    # FFmpeg Command Breakdown:
+    # -an: Removes all audio tracks
+    # -vf scale: Resizes width, -2 maintains aspect ratio (must be even for many codecs)
+    # -vcodec libx265: The most efficient modern compressor
+    # -crf 28: Quality level (23 is default, 28 is smaller, 30+ starts looking blurry)
+    # -preset faster: Balancing compression time vs. file size
+    
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', str(src),
+        '-vf', f'scale={max_width}:-2',
+        '-vcodec', 'libx265',
+        '-crf', '28',
+        '-preset', 'faster',
+        '-an', 
+        str(dst)
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to process {src.name}: {e}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1066,13 +1080,19 @@ def main():
         "--sav_dataset",
         type=str,
         required=True,
-        help="Path to SAV dataset (e.g., /graphics/scratch3/datasets/sav_val)",
+        help="Path to SAV dataset (e.g., sav_val)",
     )
     parser.add_argument(
         "--sequence_id",
         type=str,
         default=None,
         help="Specific sequence ID to process (if not provided, processes all)",
+    )
+    parser.add_argument(
+        "--sub_dir",
+        type=str,
+        default=None,
+        help="Specific sub folder of SAV dataset to process (e.g., sav_000, if not provided, processes all sub folders)",
     )
     parser.add_argument(
         "--output_dir",
@@ -1120,11 +1140,14 @@ def main():
         action="store_true",
         help="Use SA-V training format (MP4 + JSON instead of JPEG folders)",
     )
+
+    parser.add_argument(
+        "--overwrite_existing",
+        action="store_true",
+        help="Whether to overwrite existing output files (JSON and videos)",
+    )
     
     args = parser.parse_args()
-    
-    # Import here to avoid issues if not available
-    from sam3.model_builder import build_sam3_video_model
     
     # Load SAM3 model
     logger.info("Loading SAM3 model...")
@@ -1194,12 +1217,22 @@ def main():
                     })
         
         logger.info(f"Found {len(all_sequences)} sequences with annotations")
+
+        if args.sub_dir:
+            # Filter to specific subdirectory
+            all_sequences = [s for s in all_sequences if s['subdir'] == args.sub_dir]
+            if not all_sequences:
+                logger.error(f"Subdirectory {args.sub_dir} not found or contains no annotated sequences")
+                sys.exit(1)
         
         if args.sequence_id:
             # Filter to specific sequence
             all_sequences = [s for s in all_sequences if s['video_id'] == args.sequence_id]
             if not all_sequences:
-                logger.error(f"Sequence {args.sequence_id} not found")
+                if args.sub_dir:
+                    logger.error(f"Sequence {args.sequence_id} not found in subdirectory {args.sub_dir}")
+                else:
+                    logger.error(f"Sequence {args.sequence_id} not found")
                 sys.exit(1)
         
         if args.max_sequences:
@@ -1208,19 +1241,33 @@ def main():
         logger.info(f"Processing {len(all_sequences)} sequences")
         
         # Process each sequence (SA-V training format)
+        skipped_sequences = []
         sequence_summaries = []
-        all_sequences_data = []  # Collect all sequence data for single JSON file
-        temp_dirs_to_cleanup = []
         viz_videos_saved = 0
-        
+
         for seq_idx, seq_info in enumerate(all_sequences):
             video_id = seq_info['video_id']
             video_path = seq_info['video_path']
             annotation_json = seq_info['annotation_path']
+            subdir = seq_info['subdir']
             
             logger.info(f"\n{'='*60}")
             logger.info(f"Processing sequence {seq_idx+1}/{len(all_sequences)}: {video_id}")
             logger.info(f"{'='*60}")
+
+            output_subdir = output_dir / subdir
+            (output_subdir / "tracking_result").mkdir(parents=True, exist_ok=True)
+            (output_subdir / "visualization").mkdir(parents=True, exist_ok=True)
+            json_output_path = output_dir / subdir / "tracking_result" / f"{video_id}.json"
+            vis_output_path = output_dir / subdir / "visualization" / f"{video_id}.mp4"
+
+            if json_output_path.exists():
+                if args.overwrite_existing:
+                    logger.info(f"Overwriting existing output for {video_id}")
+                else:
+                    logger.info(f"SAM3's prediction for {video_id} already exists at {json_output_path}, skipping...")
+                    skipped_sequences.append(video_id)
+                    continue
             
             try:
                 # Load annotations first to check if valid
@@ -1232,18 +1279,20 @@ def main():
                 logger.info(f"  {annotations['video_frame_count']} frames, {annotations['num_objects']} objects, "
                            f"{len(annotations['annotated_frames'])} annotated frames")
                 
-                # Store annotations for the sequence
-                seq_output_dir = output_dir / video_id
-                seq_output_dir.mkdir(parents=True, exist_ok=True)
-                
                 # Get first frame masks
                 first_frame_masks_sav = load_first_frame_masks_from_sav_train(annotations)
+                for k, v in first_frame_masks_sav.items():
+                    if v is not None:
+                        print(f"  Object {k}: first frame {v['first_frame']}")
+                    else:
+                        print(f"  Object {k}: no valid first frame mask found")
+                # print(f"DEBUG: First frame masks keys: {first_frame_masks_sav}")
                 if not first_frame_masks_sav:
                     logger.warning(f"No first-frame masks found for {video_id}, skipping")
                     continue
-                
-                logger.info(f"  First frame masks: {list(first_frame_masks_sav.keys())}")
-                
+
+                # logger.info(f"  First frame masks: {first_frame_masks_sav}")
+
                 # Run tracking - SAM3 loads video directly from MP4
                 collected_data = collect_tracking_data_sav_train(
                     sequence_id=video_id,
@@ -1260,7 +1309,6 @@ def main():
                 
                 # Collect sequence data (excluding mask cache to save space)
                 data_to_save = {k: v for k, v in collected_data.items() if not k.startswith('_')}
-                all_sequences_data.append(data_to_save)
                 
                 # Save visualization video if requested (respecting max_viz_videos limit)
                 should_save_viz = args.save_videos and (args.max_viz_videos is None or viz_videos_saved < args.max_viz_videos)
@@ -1268,21 +1316,27 @@ def main():
                     # Load frames into memory only for visualization
                     frames = load_frames_from_video(video_path)
                     if frames:
-                        video_output_path = seq_output_dir / "tracking_visualization.mp4"
                         visualize_tracking_video_sav_train(
                             collected_data=collected_data,
                             frames=frames,
                             annotations=annotations,
-                            output_video_path=str(video_output_path),
+                            output_video_path=str(vis_output_path),
                             fps=args.video_fps,
                         )
                         viz_videos_saved += 1
+                        # reduce video size
+                        light_vis_output_path = vis_output_path.with_name(f"{vis_output_path.stem}_light.mp4")
+                        optimize_video(vis_output_path,
+                                    light_vis_output_path, 
+                                    max_width=640, 
+                                    overwrite=True)
                     else:
                         logger.warning(f"Could not load frames for visualization of {video_id}")
                 
                 # Save sequence summary
                 sequence_summaries.append({
                     "sequence_id": video_id,
+                    "subdir": subdir,
                     "num_frames": collected_data["num_frames"],
                     "num_objects": collected_data["num_objects"],
                     "sequence_failed": collected_data["sequence_failed"],
@@ -1298,19 +1352,15 @@ def main():
                            f"avg_iou={collected_data['avg_iou']:.3f}, "
                            f"failures={collected_data['total_failures']} (at_reappearance={collected_data['total_failures_at_reappearance']})")
                 
+                with open(json_output_path, 'w') as f:
+                    json.dump(data_to_save, f, indent=2, default=str)
+                logger.info(f"Saved data for {video_id} to {json_output_path}")
+
             except Exception as e:
                 logger.error(f"Error processing {video_id}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
-    
-    # Save all sequences data to a single JSON file
-    if all_sequences_data:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Saving all sequences data to single JSON file...")
-        with open(output_dir / "all_sequences_data.json", 'w') as f:
-            json.dump(all_sequences_data, f, indent=2, default=str)
-        logger.info(f"Saved {len(all_sequences_data)} sequences to {output_dir / 'all_sequences_data.json'}")
     
     # Save summary
     logger.info(f"\n{'='*60}")
@@ -1321,6 +1371,7 @@ def main():
     
     summary = {
         "total_sequences": len(sequence_summaries),
+        "num_skipped_sequences": len(skipped_sequences),
         "sequences_with_occlusion": len(sequences_with_occlusion),
         "failed_sequences_count": len(failed_sequences),
         "failed_sequence_ids": [s["sequence_id"] for s in failed_sequences],
@@ -1336,6 +1387,7 @@ def main():
     logger.info(f"Total sequences: {len(sequence_summaries)}")
     logger.info(f"Sequences with occlusion: {len(sequences_with_occlusion)}")
     logger.info(f"Failed sequences: {len(failed_sequences)}/{len(sequence_summaries)}")
+    logger.info(f"Skipped sequences: {len(skipped_sequences)}")
     if failed_sequences:
         logger.info(f"Failed sequence IDs: {[s['sequence_id'] for s in failed_sequences[:10]]}")
         if len(failed_sequences) > 10:
@@ -1343,6 +1395,6 @@ def main():
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"{'='*60}")
 
-
+    
 if __name__ == "__main__":
     main()
