@@ -35,6 +35,7 @@ import os
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from tqdm import tqdm
 
 import cv2
 import numpy as np
@@ -815,10 +816,16 @@ def main():
         description="Generate tracking verification training data for EasyR1",
     )
     parser.add_argument(
-        "--collected_data",
+        "--collected_dir",
         type=str,
         required=True,
-        help="Path to all_sequences_data.json from collect_training_data.py",
+        help="Path to the output folder from collect_training_data.py",
+    )
+    parser.add_argument(
+        "--sub_dir",
+        type=str,
+        required=True,
+        help="The subfolder folder in SAV dataset (e.g. sav_000, sav_001, etc.)",
     )
     parser.add_argument(
         "--frames_root",
@@ -898,25 +905,37 @@ def main():
     np.random.seed(args.seed)
     
     # Load collected data (supports both JSON array and JSONL formats)
-    logger.info(f"Loading collected data from {args.collected_data}")
-    collected_path = args.collected_data
-    if collected_path.endswith(".jsonl"):
-        # JSONL format: one JSON object per line
-        all_sequences = []
-        with open(collected_path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        all_sequences.append(json.loads(line))
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Skipping invalid JSONL line: {e}")
-    else:
-        # Standard JSON array format
-        with open(collected_path) as f:
-            all_sequences = json.load(f)
-    
-    logger.info(f"Loaded {len(all_sequences)} sequences")
+    logger.info(f"Loading collected data from folder: {args.collected_dir}")
+    collected_dir = Path(args.collected_dir)
+    sub_dir = args.sub_dir
+
+    # Load all the json files. 
+    # Folder structure: <collected_dir>/<sub_dir>/tracking_result/*.json
+    all_sequences = []
+    for current_sub_dir in collected_dir.iterdir():
+        if not current_sub_dir.is_dir():
+            continue
+        if sub_dir is not None and current_sub_dir.name != sub_dir:
+            continue
+        json_dir = current_sub_dir / "tracking_result"
+        if not json_dir.exists():
+            logger.warning(f"No tracking_result directory in {current_sub_dir}, skipping")
+            continue
+        json_files = list(json_dir.glob("*.json"))
+        if not json_files:
+            logger.warning(f"No JSON files found in {json_dir}, skipping")
+            continue
+
+        for json_file in json_files:
+            try:
+                with open(json_file) as f:
+                    data = json.load(f)
+                    all_sequences.append(data)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Skipping invalid JSON file {json_file}: {e}")
+
+    print(f"Loaded {len(all_sequences)} sequences from {collected_dir} with sub_dir={sub_dir}")
+    print(f"Example sequence keys: {list(all_sequences[0].keys()) if all_sequences else 'N/A'}")
     
     # Limit sequences if requested
     if args.max_sequences and args.max_sequences < len(all_sequences):
@@ -945,8 +964,9 @@ def main():
         "skipped_sequences": 0,
     }
     
-    for seq_data in all_sequences:
+    for i, seq_data in tqdm(enumerate(all_sequences)):
         seq_id = seq_data.get("sequence_id", "")
+        logger.info(f"Processing sequence {i}/{len(all_sequences)}: {seq_id}")
         objects = seq_data.get("objects", {})
         video_path = seq_data.get("video_path")  # MP4 path (SA-V train format)
 
