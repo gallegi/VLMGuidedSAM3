@@ -772,35 +772,30 @@ def collect_tracking_data_sav_train(
                 frame_has_gt_annotations = frame_idx in gt_masks_lookup
                 
                 # Frame has GT annotations - check for failures
-                has_gt = False
                 iou = 0.0  # Default to 0.0 (no overlap)
                 gt_mask = None  # Initialize for bbox computation
                 
-                if obj_id in gt_masks_lookup.get(frame_idx, {}):
+                if has_gt_mask:
                     gt_mask = gt_masks_lookup[frame_idx][obj_id]
-                    
-                    # Only compute IoU if object is actually present in GT (non-empty mask)
-                    if gt_mask is not None and gt_mask.sum() > 0:
-                        has_gt = True
-                        iou = compute_mask_iou(pred_mask, gt_mask)
-                        objects_summary[obj_id]["ious"].append(iou)
+                    iou = compute_mask_iou(pred_mask, gt_mask)
+                    objects_summary[obj_id]["ious"].append(iou)
                 
                 # Store per-frame data for training data generation
-                is_correct = has_gt and iou >= iou_threshold
+                is_correct = has_gt_mask and iou >= iou_threshold
                 objects_summary[obj_id]["frames"].append({
                     "frame_idx": frame_idx,
                     "has_prediction": pred_mask is not None and pred_mask.sum() > 0,
-                    "has_gt": has_gt,
+                    "has_gt": has_gt_mask,
                     "iou": round(float(iou), 2),
                     "is_correct": is_correct,
                     "pred_bbox": mask_to_bbox(pred_mask),
-                    "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
+                    "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
                 })
                 
                 # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
                 is_failure = False
                 failure_type = None
-                if has_gt:
+                if has_gt_mask:
                     # Failure if IoU is below threshold
                     if iou < iou_threshold:
                         is_failure = True
@@ -837,11 +832,11 @@ def collect_tracking_data_sav_train(
                         "frame_idx": frame_idx,
                         "iou": round(float(iou), 2),
                         "failure_type": failure_type,
-                        "has_gt": has_gt,
+                        "has_gt": has_gt_mask,
                         "is_at_sam3_reappearance": failure_is_at_sam3_reappearance,
                         "occlusion_id": failure_occlusion_id,
                         "pred_bbox": mask_to_bbox(pred_mask),
-                        "gt_bbox": mask_to_bbox(gt_mask) if has_gt else None,
+                        "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
                     })
                 
                 # Store mask for visualization only
