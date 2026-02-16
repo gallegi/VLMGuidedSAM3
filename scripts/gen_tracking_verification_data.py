@@ -505,8 +505,8 @@ def generate_samples_for_object(
     failure_frames = obj_data.get("failure_frames", [])
     
     # ALWAYS prioritize reappearance failures (even if fewer than max_incorrect_samples)
-    reapp_failures = [f for f in failure_frames if f.get("is_at_sam3_reappearance", False)]
-    other_failures = [f for f in failure_frames if not f.get("is_at_sam3_reappearance", False)]
+    reapp_failures = [f for f in failure_frames if f.get("is_at_reappearance", False)]
+    other_failures = [f for f in failure_frames if not f.get("is_at_reappearance", False)]
     random.shuffle(other_failures)
     
     # Take all reappearance failures first, then fill remaining slots with others
@@ -519,7 +519,7 @@ def generate_samples_for_object(
         frame_idx = failure["frame_idx"]
         pred_bbox = failure.get("pred_bbox")
         gt_bbox = failure.get("gt_bbox")
-        is_reappearance = failure.get("is_at_sam3_reappearance", False)
+        is_reappearance = failure.get("is_at_reappearance", False)
 
         if pred_bbox is None or gt_bbox is None:
             continue

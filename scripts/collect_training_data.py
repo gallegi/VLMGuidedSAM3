@@ -605,7 +605,7 @@ def collect_tracking_data_sav_train(
             "ious": [],  # IoU values when GT available (for computing avg)
             "frames": [],  # Per-frame data on annotated frames (for training data generation)
             "occlusions": [],  # List of {start_frame, end_frame, occlusion_id}
-            "failure_frames": [],  # List of {frame_idx, iou, is_at_sam3_reappearance, occlusion_id, pred_bbox, gt_bbox}
+            "failure_frames": [],  # List of {frame_idx, iou, is_at_reappearance, occlusion_id, pred_bbox, gt_bbox}
             "num_failures": 0,  # Count of frames with IoU < threshold
         }
     
@@ -811,7 +811,7 @@ def collect_tracking_data_sav_train(
                     # Determine if failure is at SAM3 reappearance
                     # Failures during occlusion (after occlusion starts, before reappearance) are also reappearance failures
                     # Failures at reappearance frame or within 5 frames after are also reappearance failures
-                    failure_is_at_sam3_reappearance = (
+                    failure_is_at_reappearance = (
                         obj_state["is_occluded"] or  # During occlusion
                         is_at_reappearance or  # At reappearance frame
                         obj_state["just_reappeared"]  # Within 5 frames after reappearance
@@ -821,7 +821,7 @@ def collect_tracking_data_sav_train(
                     failure_occlusion_id = None
                     if obj_state["is_occluded"]:
                         failure_occlusion_id = obj_state["current_occlusion_id"]
-                    elif failure_is_at_sam3_reappearance and obj_state["reappearance_frame"] is not None:
+                    elif failure_is_at_reappearance and obj_state["reappearance_frame"] is not None:
                         # Find the occlusion that just ended
                         for occ in objects_summary[obj_id]["occlusions"]:
                             if occ["end_frame"] == obj_state["reappearance_frame"]:
@@ -833,7 +833,7 @@ def collect_tracking_data_sav_train(
                         "iou": round(float(iou), 2),
                         "failure_type": failure_type,
                         "has_gt": has_gt_mask,
-                        "is_at_sam3_reappearance": failure_is_at_sam3_reappearance,
+                        "is_at_reappearance": failure_is_at_reappearance,
                         "occlusion_id": failure_occlusion_id,
                         "pred_bbox": mask_to_bbox(pred_mask),
                         "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
@@ -860,7 +860,7 @@ def collect_tracking_data_sav_train(
         total_gt_frames += len(data["ious"])
         
         # Count failures at SAM3 reappearance
-        failures_at_reappearance = sum(1 for f in data["failure_frames"] if f.get("is_at_sam3_reappearance", False))
+        failures_at_reappearance = sum(1 for f in data["failure_frames"] if f.get("is_at_reappearance", False))
         
         objects_final[str(obj_id)] = {
             "avg_iou": round(float(avg_iou), 2),
