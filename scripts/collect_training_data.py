@@ -44,8 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-FRAME_INTERVAL = 4
-
+ANNOTATION_INTERVAL = 4 # SA-V training annotations are at 6fps from 24fps video (every 4 frames)
 
 def compute_mask_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     """Compute IoU between predicted and ground truth masks."""
@@ -191,8 +190,8 @@ def load_sav_train_annotations(json_path: str) -> Dict:
     # SAV annotate at 6fps from 24fps video, 
     # there are annotations at every 4th frame, so we multiply annotation index by 4 to get frame index
     for obj_idx, ann_idx in enumerate(first_appeared):
-        frame_idx = int(ann_idx * FRAME_INTERVAL)  # Convert annotation index to frame index
-        first_appeared_frame[obj_idx + 1] = int(ann_idx * FRAME_INTERVAL)  # obj_id is 1-indexed
+        frame_idx = int(ann_idx * ANNOTATION_INTERVAL)  # Convert annotation index to frame index
+        first_appeared_frame[obj_idx + 1] = int(ann_idx * ANNOTATION_INTERVAL)  # obj_id is 1-indexed
     
     # Build masks dict
     # masklets is a list where masklets[ann_idx] is a list of per-object masks
@@ -209,7 +208,7 @@ def load_sav_train_annotations(json_path: str) -> Dict:
         # SA-V training: annotations at 6fps from 24fps = every 4 frames
         
         for ann_idx, frame_masks in enumerate(masklets):
-            frame_idx = ann_idx * FRAME_INTERVAL
+            frame_idx = ann_idx * ANNOTATION_INTERVAL
             if frame_idx >= video_frame_count:
                 frame_idx = video_frame_count - 1
             
@@ -222,7 +221,7 @@ def load_sav_train_annotations(json_path: str) -> Dict:
                 if mask is not None:
                     masks[frame_idx][obj_id] = mask
         
-        logger.info(f"Loaded {len(masks)} annotated frames (interval={FRAME_INTERVAL}, total_video_frames={video_frame_count})")
+        logger.info(f"Loaded {len(masks)} annotated frames (interval={ANNOTATION_INTERVAL}, total_video_frames={video_frame_count})")
     
     return {
         'num_objects': num_objects,
@@ -750,7 +749,7 @@ def collect_tracking_data_sav_train(
                         
                         objects_summary[obj_id]["occlusions"].append({
                             "start_frame": obj_state["occlusion_start_frame"],
-                            "end_frame": frame_idx,
+                            "end_frame": frame_idx-ANNOTATION_INTERVAL,  # Last occluded frame is the previous "annotated" one (since reappearance is at current frame)
                             "occlusion_id": obj_state["current_occlusion_id"],
                         })
                         obj_state["occlusion_start_frame"] = None
@@ -824,7 +823,7 @@ def collect_tracking_data_sav_train(
                     elif failure_is_at_reappearance and obj_state["reappearance_frame"] is not None:
                         # Find the occlusion that just ended
                         for occ in objects_summary[obj_id]["occlusions"]:
-                            if occ["end_frame"] == obj_state["reappearance_frame"]:
+                            if occ["end_frame"] == obj_state["reappearance_frame"] - ANNOTATION_INTERVAL:
                                 failure_occlusion_id = occ["occlusion_id"]
                                 break
                     
