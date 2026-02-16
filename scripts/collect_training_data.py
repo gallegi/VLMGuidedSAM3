@@ -799,7 +799,10 @@ def collect_tracking_data_sav_train(
                     # Failure if IoU is below threshold
                     if iou < iou_threshold:
                         is_failure = True
-                        failure_type = "low_iou"
+                        if pred_mask.sum() == 0:
+                            failure_type = "false_negative"
+                        else:
+                            failure_type = "low_iou"
                 elif frame_has_gt_annotations and pred_mask.sum() > 0:
                     # Failure if prediction exists but object not in GT (false positive on annotated frame)
                     is_failure = True
