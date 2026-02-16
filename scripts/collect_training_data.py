@@ -789,6 +789,7 @@ def collect_tracking_data_sav_train(
                     "is_correct": is_correct,
                     "pred_bbox": mask_to_bbox(pred_mask),
                     "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
+                    "is_at_reappearance": is_at_reappearance,
                 })
                 
                 # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
