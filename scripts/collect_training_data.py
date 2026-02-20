@@ -25,9 +25,12 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
+import torchvision.ops as ops
 from PIL import Image as PILImage
 
 from sam3.model_builder import build_sam3_video_model
+from sam3 import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
 
 try:
     import pycocotools.mask as mask_utils
@@ -524,13 +527,110 @@ def get_sequence_info(sequence_id: str, dataset_root: str, is_sav: bool = False)
     
     return {"sequence_id": sequence_id, "found": False}
 
+class Detector():
+    def __init__(self):
+        # Load SAM3 detector
+        self.model = build_sam3_image_model()
 
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
+        
+        self.processor = Sam3Processor(self.model, confidence_threshold=0.5)
+        self.roi_side = 7
+        self.sam3_input_size = 1008  # SAM3 processes input images to 1008x1008
+        self.feat_map_size = 72  # SAM3's feature map size
+        self.spatial_scale = self.feat_map_size / self.sam3_input_size  
+        self.sim_thresh = 0.5
+
+    def batch_iou(self, pred_boxes, gt_box):
+        x1, y1, x2, y2 = gt_box
+        # Compute IoU for each predicted box against the ground truth box
+        pred_x1 = pred_boxes[:, 0]
+        pred_y1 = pred_boxes[:, 1]
+        pred_x2 = pred_boxes[:, 2]
+        pred_y2 = pred_boxes[:, 3]
+
+        intersection_x1 = torch.maximum(pred_x1, torch.tensor(x1))
+        intersection_y1 = torch.maximum(pred_y1, torch.tensor(y1))
+        intersection_x2 = torch.minimum(pred_x2, torch.tensor(x2))
+        intersection_y2 = torch.minimum(pred_y2, torch.tensor(y2))
+
+        intersection_area = torch.maximum(intersection_x2 - intersection_x1, torch.tensor(0.0)) * \
+                            torch.maximum(intersection_y2 - intersection_y1, torch.tensor(0.0))
+
+        gt_area = (x2 - x1) * (y2 - y1)
+        union_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1) + gt_area - intersection_area
+
+        iou = intersection_area / (union_area + 1e-6)
+        return iou
+
+    def scale_boxes_sam3_input_size(self, boxes, original_size):
+        orig_H, orig_W = original_size
+        scale_x = self.sam3_input_size / orig_W
+        scale_y = self.sam3_input_size / orig_H
+        scaled_boxes = boxes.clone()
+        scaled_boxes[:, [0, 2]] *= scale_x  # Scale x1 and x2
+        scaled_boxes[:, [1, 3]] *= scale_y  # Scale y1 and y2
+        return scaled_boxes
+
+    def extract_roi_features(self, det_state, boxes):
+        feat_map = det_state['backbone_out']['vision_features']
+        device = feat_map.device
+        _, C, H, W = feat_map.shape
+        assert H == W, "Expected square feature map"
+        if not isinstance(boxes, torch.Tensor):
+            boxes = torch.tensor(boxes, device=device)
+        boxes = boxes.float()
+        # scale boxes to match SAM3's input size
+        orig_H, orig_W = det_state['original_height'], det_state['original_width']
+        boxes = self.scale_boxes_sam3_input_size(boxes, original_size=(orig_H, orig_W))
+        boxes = boxes.to(device)
+        boxes = torch.cat([torch.zeros((boxes.shape[0], 1), device=device), boxes], dim=1)  # Add batch index
+        roi_features = ops.roi_align(feat_map, boxes, output_size=(self.roi_side, self.roi_side), 
+                                     spatial_scale=self.spatial_scale)
+        roi_features = roi_features.view(roi_features.shape[0], -1)
+        # l2 normalize
+        roi_features = torch.nn.functional.normalize(roi_features, p=2, dim=1)
+        return roi_features.reshape(-1, C * self.roi_side * self.roi_side)
+
+    def compute_roi_similarity(self, det_state, target_box, candidate_boxes):
+        roi_target = self.extract_roi_features(det_state, torch.tensor(target_box).unsqueeze(0)) # (1, C*roi_side*roi_side)
+        roi_candidates = self.extract_roi_features(det_state, candidate_boxes) # (n, C*roi_side*roi_side)
+        return torch.einsum('ij,ij->i', roi_target, roi_candidates) / (torch.norm(roi_target, dim=1) * torch.norm(roi_candidates, dim=1) + 1e-6)
+
+    def detect_distractor(self, pil_image: PILImage, examplar_box: List):
+        x1, y1, x2, y2 = examplar_box
+        H, W = pil_image.size[1], pil_image.size[0]
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        w = x2 - x1
+        h = y2 - y1
+        prompted_box = [cx / W, cy / H, w / W, h / H]  # Normalize to [0, 1], format [cx,cy,w,h]
+        det_state = self.processor.set_image(pil_image)
+        det_state = self.processor.add_geometric_prompt(state=det_state, box=prompted_box, label=[True])
+        all_detected_boxes = det_state['boxes']
+
+        # # Filter out boxes that have the highest IoU with the examplar box (target object) since we only want distractors
+        if all_detected_boxes.shape[0] > 0:
+            ious = self.batch_iou(all_detected_boxes, examplar_box)
+            max_iou_idx = torch.argmax(ious)
+            all_detected_boxes = torch.cat([all_detected_boxes[:max_iou_idx], all_detected_boxes[max_iou_idx+1:]])
+        
+        if len(all_detected_boxes) > 0:
+            sim_score = self.compute_roi_similarity(det_state, examplar_box, all_detected_boxes)
+            print("Sim score:", sim_score)
+            # Filter out boxes that have low similarity with the examplar box (likely false positives)
+            all_detected_boxes = all_detected_boxes[sim_score > self.sim_thresh]
+        return all_detected_boxes
+       
 def collect_tracking_data_sav_train(
     sequence_id: str,
     video_path: str,
+    video_frames: List[np.ndarray],
     annotations: Dict,
     first_frame_masks: Dict[int, Dict],
     tracker,
+    detector: Detector,
     iou_threshold: float = 0.5,
 ) -> Dict:
     """
@@ -541,9 +641,11 @@ def collect_tracking_data_sav_train(
     Args:
         sequence_id: Video ID
         video_path: Path to MP4 video file (SAM3 loads this directly)
+        video_frames: List of numpy arrays representing video frames (for distractor detection)
         annotations: Parsed annotations from load_sav_train_annotations()
         first_frame_masks: First-frame masks from load_first_frame_masks_from_sav_train()
         tracker: SAM3 tracker
+        detector: SAM3 detector for detecting similar visual objects (distractors)
         iou_threshold: IoU threshold for CORRECT/INCORRECT
     
     Returns:
@@ -774,11 +876,36 @@ def collect_tracking_data_sav_train(
                 iou = 0.0  # Default to 0.0 (no overlap)
                 gt_mask = None  # Initialize for bbox computation
                 
+                distractor_boxes = []
+                gt_box = None
                 if has_gt_mask:
                     gt_mask = gt_masks_lookup[frame_idx][obj_id]
                     iou = compute_mask_iou(pred_mask, gt_mask)
                     objects_summary[obj_id]["ious"].append(iou)
-                
+
+                    # run detector to get distractors, using GT box as exemplar
+                    # run only at reappearance period
+                    if is_at_reappearance or obj_state["just_reappeared"]:
+                        print("Frame index:", frame_idx, "Object ID:", obj_id)
+                        gt_box = mask_to_bbox(gt_mask)
+                        pil_image = PILImage.fromarray(video_frames[frame_idx])
+                        distractor_boxes = detector.detect_distractor(pil_image, examplar_box=gt_box).int().cpu().numpy().tolist()
+
+                        # for debugging
+                        if len(distractor_boxes) > 0:
+                            logger.info(f"Frame {frame_idx}, Object {obj_id}, GT box={gt_box}, Num distractors={len(distractor_boxes)}")
+                            # draw GT box in green and distractor boxes in red for debugging
+                            debug_image = video_frames[frame_idx].copy()
+                            for x1,y1,x2,y2 in distractor_boxes:
+                                cv2.rectangle(debug_image, (x1,y1), (x2,y2), (255,0,0), 2)  # Red for distractors
+                            if gt_box is not None:
+                                x1,y1,x2,y2 = gt_box
+                                cv2.rectangle(debug_image, (x1,y1), (x2,y2), (0,255,0), 2)  # Green for GT
+                            distractor_debug_dir = "/graphics/scratch2/students/nguyenth/SAV/distractors"
+                            os.makedirs(distractor_debug_dir, exist_ok=True)
+                            cv2.imwrite(f"{distractor_debug_dir}/{sequence_id}_frame{frame_idx}_obj{obj_id}.png", 
+                                        cv2.cvtColor(debug_image, cv2.COLOR_RGB2BGR))
+
                 # Store per-frame data for training data generation
                 is_correct = has_gt_mask and iou >= iou_threshold
                 objects_summary[obj_id]["frames"].append({
@@ -788,9 +915,11 @@ def collect_tracking_data_sav_train(
                     "iou": round(float(iou), 2),
                     "is_correct": is_correct,
                     "pred_bbox": mask_to_bbox(pred_mask),
-                    "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
+                    "gt_bbox": gt_box,
                     "is_at_reappearance": is_at_reappearance,
                 })
+                if len(distractor_boxes) > 0:
+                    objects_summary[obj_id]["frames"][-1]["distractor_boxes"] = distractor_boxes
                 
                 # Track failures: low IoU OR prediction exists but object not in GT (on annotated frame)
                 is_failure = False
@@ -841,6 +970,8 @@ def collect_tracking_data_sav_train(
                         "pred_bbox": mask_to_bbox(pred_mask),
                         "gt_bbox": mask_to_bbox(gt_mask) if has_gt_mask else None,
                     })
+                    if len(distractor_boxes) > 0:
+                        objects_summary[obj_id]["failure_frames"][-1]["distractor_boxes"] = distractor_boxes
                 
                 # Store mask for visualization only
                 if frame_idx not in pred_masks_cache:
@@ -1152,8 +1283,8 @@ def main():
     
     args = parser.parse_args()
     
-    # Load SAM3 model
-    logger.info("Loading SAM3 model...")
+    # Load SAM3 tracker
+    logger.info("Loading SAM3 tracker...")
     sam3_model = build_sam3_video_model()
     tracker = sam3_model.tracker
     tracker.backbone = sam3_model.detector.backbone
@@ -1161,6 +1292,10 @@ def main():
     
     if torch.cuda.is_available():
         tracker = tracker.cuda()
+
+    # Load detector
+    logger.info("Loading SAM3 detector...")
+    detector = Detector()
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -1284,11 +1419,6 @@ def main():
                 
                 # Get first frame masks
                 first_frame_masks_sav = load_first_frame_masks_from_sav_train(annotations)
-                for k, v in first_frame_masks_sav.items():
-                    if v is not None:
-                        print(f"  Object {k}: first frame {v['first_frame']}")
-                    else:
-                        print(f"  Object {k}: no valid first frame mask found")
                 # print(f"DEBUG: First frame masks keys: {first_frame_masks_sav}")
                 if not first_frame_masks_sav:
                     logger.warning(f"No first-frame masks found for {video_id}, skipping")
@@ -1296,13 +1426,18 @@ def main():
 
                 # logger.info(f"  First frame masks: {first_frame_masks_sav}")
 
+                # Load frames into memory only for distractor detection and visualization
+                frames = load_frames_from_video(video_path)
+
                 # Run tracking - SAM3 loads video directly from MP4
                 collected_data = collect_tracking_data_sav_train(
                     sequence_id=video_id,
                     video_path=video_path,
+                    video_frames=frames,
                     annotations=annotations,
                     first_frame_masks=first_frame_masks_sav,
                     tracker=tracker,
+                    detector=detector,
                     iou_threshold=args.iou_threshold,
                 )
                 
@@ -1316,8 +1451,6 @@ def main():
                 # Save visualization video if requested (respecting max_viz_videos limit)
                 should_save_viz = args.save_videos and (args.max_viz_videos is None or viz_videos_saved < args.max_viz_videos)
                 if should_save_viz:
-                    # Load frames into memory only for visualization
-                    frames = load_frames_from_video(video_path)
                     if frames:
                         visualize_tracking_video_sav_train(
                             collected_data=collected_data,
