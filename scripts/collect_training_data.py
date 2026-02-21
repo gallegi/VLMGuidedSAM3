@@ -618,7 +618,7 @@ class Detector():
         
         if len(all_detected_boxes) > 0:
             sim_score = self.compute_roi_similarity(det_state, examplar_box, all_detected_boxes)
-            print("Sim score:", sim_score)
+            # print("Sim score:", sim_score)
             # Filter out boxes that have low similarity with the examplar box (likely false positives)
             all_detected_boxes = all_detected_boxes[sim_score > self.sim_thresh]
         return all_detected_boxes
@@ -891,20 +891,20 @@ def collect_tracking_data_sav_train(
                         pil_image = PILImage.fromarray(video_frames[frame_idx])
                         distractor_boxes = detector.detect_distractor(pil_image, examplar_box=gt_box).int().cpu().numpy().tolist()
 
-                        # for debugging
-                        if len(distractor_boxes) > 0:
-                            logger.info(f"Frame {frame_idx}, Object {obj_id}, GT box={gt_box}, Num distractors={len(distractor_boxes)}")
-                            # draw GT box in green and distractor boxes in red for debugging
-                            debug_image = video_frames[frame_idx].copy()
-                            for x1,y1,x2,y2 in distractor_boxes:
-                                cv2.rectangle(debug_image, (x1,y1), (x2,y2), (255,0,0), 2)  # Red for distractors
-                            if gt_box is not None:
-                                x1,y1,x2,y2 = gt_box
-                                cv2.rectangle(debug_image, (x1,y1), (x2,y2), (0,255,0), 2)  # Green for GT
-                            distractor_debug_dir = "/graphics/scratch2/students/nguyenth/SAV/distractors"
-                            os.makedirs(distractor_debug_dir, exist_ok=True)
-                            cv2.imwrite(f"{distractor_debug_dir}/{sequence_id}_frame{frame_idx}_obj{obj_id}.png", 
-                                        cv2.cvtColor(debug_image, cv2.COLOR_RGB2BGR))
+                        # # for debugging
+                        # if len(distractor_boxes) > 0:
+                        #     logger.info(f"Frame {frame_idx}, Object {obj_id}, GT box={gt_box}, Num distractors={len(distractor_boxes)}")
+                        #     # draw GT box in green and distractor boxes in red for debugging
+                        #     debug_image = video_frames[frame_idx].copy()
+                        #     for x1,y1,x2,y2 in distractor_boxes:
+                        #         cv2.rectangle(debug_image, (x1,y1), (x2,y2), (255,0,0), 2)  # Red for distractors
+                        #     if gt_box is not None:
+                        #         x1,y1,x2,y2 = gt_box
+                        #         cv2.rectangle(debug_image, (x1,y1), (x2,y2), (0,255,0), 2)  # Green for GT
+                        #     distractor_debug_dir = "/graphics/scratch2/students/nguyenth/SAV/distractors"
+                        #     os.makedirs(distractor_debug_dir, exist_ok=True)
+                        #     cv2.imwrite(f"{distractor_debug_dir}/{sequence_id}_frame{frame_idx}_obj{obj_id}.png", 
+                        #                 cv2.cvtColor(debug_image, cv2.COLOR_RGB2BGR))
 
                 # Store per-frame data for training data generation
                 is_correct = has_gt_mask and iou >= iou_threshold
