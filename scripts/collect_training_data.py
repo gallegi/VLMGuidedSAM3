@@ -880,6 +880,7 @@ def collect_tracking_data_sav_train(
                 gt_box = None
                 if has_gt_mask:
                     gt_mask = gt_masks_lookup[frame_idx][obj_id]
+                    gt_box = mask_to_bbox(gt_mask)
                     iou = compute_mask_iou(pred_mask, gt_mask)
                     objects_summary[obj_id]["ious"].append(iou)
 
@@ -887,7 +888,6 @@ def collect_tracking_data_sav_train(
                     # run only at reappearance period
                     if is_at_reappearance or obj_state["just_reappeared"]:
                         print("Frame index:", frame_idx, "Object ID:", obj_id)
-                        gt_box = mask_to_bbox(gt_mask)
                         pil_image = PILImage.fromarray(video_frames[frame_idx])
                         distractor_boxes = detector.detect_distractor(pil_image, examplar_box=gt_box).int().cpu().numpy().tolist()
 
