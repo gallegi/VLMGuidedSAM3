@@ -555,8 +555,8 @@ def generate_samples_for_object(
     failure_frames = obj_data.get("failure_frames", [])
     
     # Separate reappearance vs other failures
-    reapp_failures = [f for f in failure_frames if f.get("is_at_sam3_reappearance", False)]
-    other_failures = [f for f in failure_frames if not f.get("is_at_sam3_reappearance", False)]
+    reapp_failures = [f for f in failure_frames if f.get("is_at_reappearance", False)]
+    other_failures = [f for f in failure_frames if not f.get("is_at_reappearance", False)]
     random.shuffle(other_failures)
     
     if reappearance_only:
@@ -573,7 +573,7 @@ def generate_samples_for_object(
         frame_idx = failure["frame_idx"]
         pred_bbox = failure.get("pred_bbox")  # None when SAM3 didn't predict (missed detection)
         gt_bbox = failure.get("gt_bbox")  # None when object is not visible (false positive)
-        is_reappearance = failure.get("is_at_sam3_reappearance", False)
+        is_reappearance = failure.get("is_at_reappearance", False)
         object_not_present = (gt_bbox is None)
         sam3_no_prediction = (pred_bbox is None)
         both_none = (pred_bbox is None and gt_bbox is None)
@@ -715,40 +715,11 @@ def generate_samples_for_object(
         # These are frames where SAM3 correctly re-identified the object after it
         # reappeared, paired with the same pre-occlusion context so the model sees
         # both successful and failed reappearances.
-        occlusions = obj_data.get("occlusions", [])
-        reapp_correct_candidates = []  # list of (frame_dict, occlusion_id)
+        reapp_candidates = [(f, None) for f in obj_frames if f.get("is_at_reappearance", False) and f.get("is_correct", False)
+                             and f.get("iou", 0.0) >= correct_iou_threshold]
 
-        for occ in occlusions:
-            end_frame = occ.get("end_frame")
-            occ_id = occ.get("occlusion_id")
-            if end_frame is None:
-                continue
-
-            for f in obj_frames:
-                if f["frame_idx"] < end_frame:
-                    continue  # Before reappearance — skip
-                if f["frame_idx"] > end_frame + reappearance_window:
-                    continue
-                if not f.get("is_correct", False):
-                    continue
-                if not f.get("has_gt", False):
-                    continue
-                if f.get("iou", 0.0) < correct_iou_threshold:
-                    continue
-                if f.get("pred_bbox") is None:
-                    continue
-                reapp_correct_candidates.append((f, occ_id))
-
-        # Deduplicate by frame_idx (a frame could fall in window of multiple occlusions)
-        seen_frame_idxs = set()
-        unique_candidates = []
-        for f, occ_id in reapp_correct_candidates:
-            if f["frame_idx"] not in seen_frame_idxs:
-                seen_frame_idxs.add(f["frame_idx"])
-                unique_candidates.append((f, occ_id))
-
-        random.shuffle(unique_candidates)
-        correct_to_process = unique_candidates[:num_correct]
+        random.shuffle(reapp_candidates)
+        correct_to_process = reapp_candidates[:num_correct]
     else:
         # Generic: any correctly-tracked frame
         correct_frames = [
@@ -767,7 +738,7 @@ def generate_samples_for_object(
 
         # Use reappearance context (pre-occlusion + during-occlusion frames)
         # so the model sees the same visual pattern for both CORRECT and INCORRECT
-        if reappearance_only and occ_id is not None:
+        if reappearance_only:
             context = find_reappearance_context_frames(
                 obj_frames=obj_frames,
                 obj_data=obj_data,
@@ -978,10 +949,22 @@ def main():
         description="Generate tracking verification training data for EasyR1",
     )
     parser.add_argument(
-        "--collected_data",
+        "--collected_dir",
         type=str,
         required=True,
-        help="Path to all_sequences_data.json from collect_training_data.py",
+        help="Path to the output folder from collect_training_data.py",
+    )
+    parser.add_argument(
+        "--sub_dir",
+        type=str,
+        required=True,
+        help="The subfolder folder in SAV dataset (e.g. sav_000, sav_001, etc.)",
+    )
+    parser.add_argument(
+        "--sequence_id",
+        type=str,
+        default=None,
+        help="If specified, only process this sequence ID (e.g. 'sav_0000001')"
     )
     parser.add_argument(
         "--frames_root",
@@ -1071,36 +1054,61 @@ def main():
         help="Number of frames after occlusion end to consider as 'reappearance' for "
              "CORRECT samples (only used with --reappearance_only). Default: 30.",
     )
+    parser.add_argument(
+        "--overwrite_existing",
+        action="store_true",
+        default=False,
+        help="Whether to overwrite existing output JSON file. By default, the script will "
+             "resume from existing file and skip already-processed sequences. Use this flag to "
+             "start fresh and overwrite any existing output.",
+    )
     args = parser.parse_args()
     
     random.seed(args.seed)
     np.random.seed(args.seed)
-    
+
     # Load collected data (supports both JSON array and JSONL formats)
-    logger.info(f"Loading collected data from {args.collected_data}")
-    collected_path = args.collected_data
-    if collected_path.endswith(".jsonl"):
-        # JSONL format: one JSON object per line
-        all_sequences = []
-        with open(collected_path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        all_sequences.append(json.loads(line))
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Skipping invalid JSONL line: {e}")
-    else:
-        # Standard JSON array format
-        with open(collected_path) as f:
-            all_sequences = json.load(f)
+    logger.info(f"Loading collected data from folder: {args.collected_dir}")
+    collected_dir = Path(args.collected_dir)
+    sub_dir = args.sub_dir
     
-    logger.info(f"Loaded {len(all_sequences)} sequences")
+    # Load all the json files. 
+    # Folder structure: <collected_dir>/<sub_dir>/tracking_result/*.json
+    all_sequences = []
+    for current_sub_dir in collected_dir.iterdir():
+        if not current_sub_dir.is_dir():
+            continue
+        if sub_dir is not None and current_sub_dir.name != sub_dir:
+            continue
+        json_dir = current_sub_dir / "tracking_result"
+        if not json_dir.exists():
+            logger.warning(f"No tracking_result directory in {current_sub_dir}, skipping")
+            continue
+        json_files = list(json_dir.glob("*.json"))
+        if not json_files:
+            logger.warning(f"No JSON files found in {json_dir}, skipping")
+            continue
+
+        for json_file in json_files:
+            try:
+                with open(json_file) as f:
+                    data = json.load(f)
+                    all_sequences.append(data)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Skipping invalid JSON file {json_file}: {e}")
+
+    print(f"Loaded {len(all_sequences)} sequences from {collected_dir} with sub_dir={sub_dir}")
+    print(f"Example sequence keys: {list(all_sequences[0].keys()) if all_sequences else 'N/A'}")
     
     # Limit sequences if requested
     if args.max_sequences and args.max_sequences < len(all_sequences):
         all_sequences = all_sequences[:args.max_sequences]
         logger.info(f"Limited to {len(all_sequences)} sequences (--max_sequences={args.max_sequences})")
+
+    # Filter only chosen sequence_id if specified
+    if args.sequence_id:
+        all_sequences = [s for s in all_sequences if s.get("sequence_id") == args.sequence_id]
+        logger.info(f"Filtered to sequence_id={args.sequence_id}, {len(all_sequences)} sequences remain")
     
     # Create output directories
     output_dir = Path(args.output_dir)
@@ -1115,25 +1123,30 @@ def main():
         viz_dir.mkdir(exist_ok=True)
     
     # Resume: Load existing samples and track which sequences have been processed
+    if args.overwrite_existing:
+        logger.info(f"--overwrite_existing specified, starting fresh and ignoring any existing output file.")
     output_json_path = output_dir / args.output_json
     all_samples = []
     processed_sequences = set()
     
     if output_json_path.exists():
         logger.info(f"Found existing output file: {output_json_path}")
-        logger.info("Loading existing samples to resume processing...")
-        with open(output_json_path) as f:
-            existing_samples = json.load(f)
-        all_samples = existing_samples
-        # Extract sequence IDs from problem_id (format: "{sequence_id}_obj{obj_id}")
-        for sample in existing_samples:
-            problem_id = sample.get("problem_id", "")
-            if problem_id:
-                # Extract sequence_id (everything before "_obj")
-                seq_id = problem_id.split("_obj")[0]
-                processed_sequences.add(seq_id)
-        logger.info(f"Loaded {len(existing_samples)} existing samples from {len(processed_sequences)} sequences")
-        logger.info(f"Will skip already-processed sequences: {sorted(list(processed_sequences))[:10]}{'...' if len(processed_sequences) > 10 else ''}")
+        if not args.overwrite_existing:
+            logger.info("Loading existing samples to resume processing...")
+            with open(output_json_path) as f:
+                existing_samples = json.load(f)
+            all_samples = existing_samples
+            # Extract sequence IDs from problem_id (format: "{sequence_id}_obj{obj_id}")
+            for sample in existing_samples:
+                problem_id = sample.get("problem_id", "")
+                if problem_id:
+                    # Extract sequence_id (everything before "_obj")
+                    seq_id = problem_id.split("_obj")[0]
+                    processed_sequences.add(seq_id)
+            logger.info(f"Loaded {len(existing_samples)} existing samples from {len(processed_sequences)} sequences")
+            logger.info(f"Will skip already-processed sequences: {sorted(list(processed_sequences))[:10]}{'...' if len(processed_sequences) > 10 else ''}")
+        else:
+            logger.info(f"--overwrite_existing is True, ignoring existing file and starting fresh.")
     else:
         logger.info("No existing output file found. Starting fresh.")
     
@@ -1162,6 +1175,8 @@ def main():
             logger.info(f"Skipping already-processed sequence: {seq_id}")
             stats["skipped_sequences"] += 1
             continue
+
+        logger.info(f"Processing sequence: {seq_id}")
 
         if not objects:
             stats["skipped_sequences"] += 1
