@@ -36,7 +36,8 @@ python scripts/gen_tracking_verification_data.py \
     --sub_dir sav_000 \
     --output_dir /graphics/scratch2/students/nguyenth/SAV/vlm_formatted_data \
     --output_json /graphics/scratch2/students/nguyenth/SAV/vlm_formatted_data/tracking_verification_train.json \
-    --max_samples_per_object 2 \
+    --max_samples_per_object 5 \
+    --reappearance_only \
 ```
 - The script results in a folder with the following structure:
 ```

@@ -32,7 +32,6 @@ Usage (reappearance-only mode - for fine-tuning on reappearance detection):
         --collected_data /path/to/all_sequences_data.json \
         --output_dir /path/to/output \
         --reappearance_only \
-        --reappearance_window 30
 """
 
 import argparse
@@ -504,7 +503,6 @@ def generate_samples_for_object(
     correct_iou_threshold: float,
     resize: Optional[int],
     reappearance_only: bool = False,
-    reappearance_window: int = 30,
 ) -> List[Dict]:
     """Generate training samples for one object in one sequence.
 
@@ -1048,13 +1046,6 @@ def main():
              "Both use pre-occlusion context frames so the model learns the reappearance pattern.",
     )
     parser.add_argument(
-        "--reappearance_window",
-        type=int,
-        default=30,
-        help="Number of frames after occlusion end to consider as 'reappearance' for "
-             "CORRECT samples (only used with --reappearance_only). Default: 30.",
-    )
-    parser.add_argument(
         "--overwrite_existing",
         action="store_true",
         default=False,
@@ -1206,7 +1197,6 @@ def main():
                 correct_iou_threshold=args.correct_iou_threshold,
                 resize=args.resize,
                 reappearance_only=args.reappearance_only,
-                reappearance_window=args.reappearance_window,
             )
 
             for s in samples:
@@ -1254,8 +1244,6 @@ def main():
     
     logger.info(f"\n{'='*60}")
     logger.info(f"Data generation complete!")
-    if args.reappearance_only:
-        logger.info(f"  Mode: REAPPEARANCE ONLY (window={args.reappearance_window} frames)")
     if initial_sample_count > 0:
         logger.info(f"  Existing samples: {initial_sample_count}")
         logger.info(f"  New samples added: {len(all_samples) - initial_sample_count}")
