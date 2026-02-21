@@ -842,7 +842,7 @@ def generate_samples_for_object(
 
 # ===================== Main =====================
 
-def _save_viz_grid(sample: Dict, images_dir: Path, viz_dir: Path, viz_idx: int) -> None:
+def _save_viz_grid(sample: Dict, images_dir: Path, viz_dir: Path, viz_idx: int, viz_meta_data: Dict = None) -> None:
     """Save a visualization grid for one training sample.
     
     Shows all context frames + query frame side by side with labels.
@@ -940,7 +940,7 @@ def _save_viz_grid(sample: Dict, images_dir: Path, viz_dir: Path, viz_idx: int) 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     grid = np.vstack([title_bar, grid])
 
-    out_path = viz_dir / f"viz_{viz_idx:04d}_{assessment.lower()}.jpg"
+    out_path = viz_dir / f"viz_{viz_idx:04d}_{viz_meta_data['sequence_id']}_obj{viz_meta_data['object_id']}_{assessment.lower()}.jpg"
     cv2.imwrite(str(out_path), grid)
 
 
@@ -1232,7 +1232,8 @@ def main():
                 for sample in samples:
                     if viz_saved >= args.save_viz:
                         break
-                    _save_viz_grid(sample, images_dir, viz_dir, viz_saved)
+                    viz_meta_data = {"sequence_id": seq_id, "object_id": obj_id}
+                    _save_viz_grid(sample, images_dir, viz_dir, viz_saved, viz_meta_data)
                     viz_saved += 1
 
             all_samples.extend(samples)
