@@ -1466,6 +1466,8 @@ def main():
                                     light_vis_output_path, 
                                     max_width=640, 
                                     overwrite=True)
+                        # delete original large video
+                        vis_output_path.unlink()
                     else:
                         logger.warning(f"Could not load frames for visualization of {video_id}")
                 
